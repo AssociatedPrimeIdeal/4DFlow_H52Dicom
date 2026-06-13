@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h52dicom"
+version = "0.1.0"
+description = "Convert 4D flow H5 arrays to DICOM series."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+  {name = "Yuyang Ren"},
+]
+dependencies = [
+  "h5py",
+  "numpy",
+  "pydicom",
+  "tqdm",
+]
+
+[project.scripts]
+h52dicom = "h52dicom.converter:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
