@@ -14,6 +14,17 @@ pip install .
 h52dicom --file-path <input.h5> --out-path <output_dir>
 ```
 
+To remove patient/scanner metadata inherited from the Siemens template while
+keeping the generated patient name/ID, dates, ShanghaiTech labels, and CVI
+flow tags, add `--anonymize`:
+
+```bash
+h52dicom --file-path <input.h5> --out-path <output_dir> --patient-name <case> --anonymize
+```
+
+The anonymization flag is opt-in; without it, template metadata behavior is
+unchanged.
+
 Legacy entry point:
 
 ```bash
