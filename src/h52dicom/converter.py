@@ -593,10 +593,10 @@ def _write_series(
         _anonymize_template_dataset(tar_dcm)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_orientation = tuple(float(value) for value in para["image_orientation"])
     slice_normal = np.asarray(para["slice_normal"], dtype=np.float64)
-    _set_if_present(tar_dcm, 0x00200037, list(image_orientation))
-    _set_if_present(tar_dcm, 0x0051100E, para["orientation"])
+    # Keep the template's ImageOrientationPatient (0020,0037) and Siemens
+    # private orientation (0051,100E) unchanged.  The latter is ``Tra`` in
+    # the supplied templates.
     _set_if_present(tar_dcm, 0x00180088, para["slice_resolution"])
 
     _set_if_present(tar_dcm, 0x0020000D, para["study_uid"])
@@ -837,7 +837,6 @@ def convert_array_to_dicom(
             "pixel_spacing": [_format_dicom_decimal(pixel_size[2]), _format_dicom_decimal(pixel_size[1])],
             "sequence_info": sequence_info[target_index],
             "orientation": orientation,
-            "image_orientation": image_orientation,
             "slice_normal": slice_normal,
             "image_origin": image_origin,
             "ori_min": int(np.min(img[..., :-1, :])),
