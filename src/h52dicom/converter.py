@@ -724,7 +724,10 @@ def convert_array_to_dicom(
     venc_order = np.asarray([str(value).upper() for value in venc_order])
     venc_value = np.asarray(venc_value, dtype=np.float32).reshape(-1)
     spatial_order = np.asarray([str(value).upper() for value in spatial_order])
-    pixel_size = np.asarray(pixel_size, dtype=np.float32).reshape(-1)
+    # Keep double precision here because the historical Array2Dicom writer
+    # builds its FoV text with Python ``str(float)``; converting to float32
+    # first changes strings such as ``16.8`` into ``16.799999``.
+    pixel_size = np.asarray(pixel_size, dtype=np.float64).reshape(-1)
     date = date or _current_date()
 
     if venc_order.size != 3 or spatial_order.size != 3 or pixel_size.size != 3:
@@ -768,12 +771,17 @@ def convert_array_to_dicom(
         spatial_indices[0], spatial_indices[1], spatial_indices[2], 4, 3
     )
     img[..., :-1, :] *= venc_signs[None, None, None, :, None]
-    img[..., :-1, :] = img[..., :-1, :] / np.pi * venc_value[None, None, None, :, None]
+    # H5 phase is encoded with the nominal/theoretical VENC.  Convert it to
+    # velocity and clip values outside the acquisition range instead of
+    # changing the VENC advertised by the DICOM tags.  CVI expects the pixel
+    # encoding and ``vXXX_*`` labels to use the same fixed VENC.
+    nominal_venc = np.asarray(venc_value, dtype=np.float32).copy()
+    nominal_venc_broadcast = nominal_venc[None, None, None, :, None]
+    velocity = img[..., :-1, :] / np.pi * nominal_venc_broadcast
+    velocity = np.clip(velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
+    img[..., :-1, :] = velocity / nominal_venc_broadcast * np.pi
 
-    actual_venc_value = np.maximum(
-        np.ceil(venc_value).astype("int16"),
-        np.ceil(np.max(np.abs(img[..., :-1, :]), axis=(0, 1, 2, 4))).astype("int16"),
-    )
+    actual_venc_value = np.ceil(nominal_venc).astype("int16")
     if spatial_signs[0] == -1:
         img = img[::-1]
     if spatial_signs[1] == -1:
@@ -794,7 +802,7 @@ def convert_array_to_dicom(
     spe, pe, fe, nv, nt = img.shape
     if nv != 4:
         raise ValueError(f"Expected 4 channels after reordering, got {nv}.")
-    fov = np.array([spe * pixel_size[0], pe * pixel_size[1], fe * pixel_size[2]], dtype=np.float32)
+    fov = np.array([spe * pixel_size[0], pe * pixel_size[1], fe * pixel_size[2]], dtype=np.float64)
     matrix_size = np.array([spe, pe, fe], dtype=np.int32)
     mean_venc = int(np.mean(actual_venc_value))
     series_number_base = 300 + mean_venc
@@ -825,7 +833,9 @@ def convert_array_to_dicom(
             "slice_resolution": _format_dicom_decimal(pixel_size[0]),
             "rows": int(matrix_size[1]),
             "columns": int(matrix_size[2]),
-            "fov_text": f"FoV {_format_dicom_decimal(fov[1])}*{_format_dicom_decimal(fov[2])}",
+            # Match Array2Dicom4cry_v9 exactly (including its native float
+            # representation, e.g. ``FoV 16.8*13.200000000000001``).
+            "fov_text": f"FoV {fov[1]}*{fov[2]}",
             "slice_text": f"SL {_format_dicom_decimal(pixel_size[0])}i",
             "acq_matrix_text": f"{matrix_size[1]}*{matrix_size[2]}",
             "pixel_spacing": [_format_dicom_decimal(pixel_size[2]), _format_dicom_decimal(pixel_size[1])],
