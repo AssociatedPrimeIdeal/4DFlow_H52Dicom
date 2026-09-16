@@ -593,11 +593,10 @@ def _write_series(
         _anonymize_template_dataset(tar_dcm)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    slice_normal = np.asarray(para["slice_normal"], dtype=np.float64)
-    # Keep the template's ImageOrientationPatient (0020,0037) and Siemens
-    # private orientation (0051,100E) unchanged.  The latter is ``Tra`` in
-    # the supplied templates.
-    _set_if_present(tar_dcm, 0x00180088, para["slice_resolution"])
+    # CVI compatibility mode: pixels have already been transposed/flipped into
+    # the requested view, but every orientation/position field remains in the
+    # template's native transverse coordinate convention.  This intentionally
+    # mirrors the historical Array2Dicom writer.
 
     _set_if_present(tar_dcm, 0x0020000D, para["study_uid"])
     _set_if_present(tar_dcm, 0x0020000E, para["series_uid"])
@@ -639,10 +638,13 @@ def _write_series(
     if phase:
         _set_if_present(tar_dcm, 0x00511014, para["sequence_info"])
 
-    # The template comes from another examination, so its ImagePositionPatient
-    # cannot describe this reoriented volume.  Start from the calculated first
-    # voxel instead of inheriting a foot-side or left-side origin.
-    base_image_position = np.asarray(para["image_origin"], dtype=np.float64)
+    base_image_position = deepcopy(ori_dcm[0x00200032].value)
+    private_position = ori_dcm.get(0x00191015)
+    base_private_position = (
+        deepcopy(private_position.value)
+        if private_position is not None
+        else deepcopy(base_image_position)
+    )
     total_iterations = int(para["cardiac_phase"]) * data.shape[0]
     out_files: list[Path] = []
     index = 1
@@ -650,7 +652,8 @@ def _write_series(
     with tqdm(total=total_iterations) as pbar:
         for i in range(int(para["cardiac_phase"])):
             cardiac_time_seconds = i * float(rr) / int(para["cardiac_phase"]) / 1000.0
-            image_position = base_image_position.copy()
+            image_position = deepcopy(base_image_position)
+            slice_position = deepcopy(base_private_position)
 
             _set_if_present(tar_dcm, 0x00181060, str(np.around(i * rr / int(para["cardiac_phase"]), decimals=3)))
 
@@ -666,27 +669,25 @@ def _write_series(
                 # DICOM importers reject it before inspecting the flow metadata.
                 tar_dcm.file_meta.MediaStorageSOPInstanceUID = instance_uid
                 tar_dcm.file_meta.MediaStorageSOPClassUID = tar_dcm.SOPClassUID
-                _set_if_present(tar_dcm, 0x00191015, [float(value) for value in image_position])
+                _set_if_present(tar_dcm, 0x00191015, deepcopy(slice_position))
                 _set_if_present(tar_dcm, 0x00200013, str(index))
-                _set_if_present(tar_dcm, 0x00200032, [float(value) for value in image_position])
-                slice_location = float(np.dot(image_position, slice_normal))
-                _set_if_present(tar_dcm, 0x00201041, _format_dicom_decimal(slice_location))
+                _set_if_present(tar_dcm, 0x00200032, deepcopy(image_position))
+                slice_location = float(image_position[-1])
+                _set_if_present(tar_dcm, 0x00201041, str(slice_location))
 
                 slice_data = np.asarray(np.squeeze(data[j, :, :, i]))
                 _set_if_present(tar_dcm, 0x00280106, int(np.min(slice_data)))
                 _set_if_present(tar_dcm, 0x00280107, int(np.max(slice_data)))
-                _set_if_present(
-                    tar_dcm,
-                    0x0051100D,
-                    _format_slice_position_text(image_position, para["orientation"], slice_normal),
-                )
+                position_label = "H" if slice_location >= 0.0 else "F"
+                _set_if_present(tar_dcm, 0x0051100D, f"SP {position_label}{np.round(abs(slice_location))}")
 
                 tar_dcm.PixelData = slice_data.tobytes()
                 output_file = output_dir / f"img{index:04d}-{np.round(slice_location, 4)}.dcm"
                 tar_dcm.save_as(str(output_file))
                 out_files.append(output_file)
 
-                image_position += slice_normal * float(para["slice_resolution"])
+                slice_position[-1] += float(para["slice_resolution"])
+                image_position[-1] += float(para["slice_resolution"])
                 index += 1
                 pbar.update(1)
 
@@ -781,7 +782,6 @@ def convert_array_to_dicom(
         img = img[:, :, ::-1]
 
     sequence_info, sequence_name = _build_labels(orientation, actual_venc_value)
-    image_orientation, slice_normal = _orientation_geometry(orientation)
     reference_paths = _resolve_reference_files()
 
     target_root = Path(out_path)
@@ -796,12 +796,6 @@ def convert_array_to_dicom(
         raise ValueError(f"Expected 4 channels after reordering, got {nv}.")
     fov = np.array([spe * pixel_size[0], pe * pixel_size[1], fe * pixel_size[2]], dtype=np.float32)
     matrix_size = np.array([spe, pe, fe], dtype=np.int32)
-    image_origin = _centered_image_origin(
-        matrix_size,
-        pixel_size,
-        image_orientation,
-        slice_normal,
-    )
     mean_venc = int(np.mean(actual_venc_value))
     series_number_base = 300 + mean_venc
     out_files: list[Path] = []
@@ -837,8 +831,6 @@ def convert_array_to_dicom(
             "pixel_spacing": [_format_dicom_decimal(pixel_size[2]), _format_dicom_decimal(pixel_size[1])],
             "sequence_info": sequence_info[target_index],
             "orientation": orientation,
-            "slice_normal": slice_normal,
-            "image_origin": image_origin,
             "ori_min": int(np.min(img[..., :-1, :])),
             "ori_max": int(np.max(img[..., :-1, :])),
             "target_min": target_min[target_index],
