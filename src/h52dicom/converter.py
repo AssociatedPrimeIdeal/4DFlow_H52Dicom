@@ -6,6 +6,7 @@ import argparse
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any, Sequence
 
 import h5py
@@ -54,75 +55,7 @@ _AXIS_DIRECTION_LPS = {
     "FH": (0.0, 0.0, 1.0),
     "HF": (0.0, 0.0, -1.0),
 }
-DEFAULT_TEMPLATE_ROOT = Path(
-    "/nas-data/ryy_rawdata"
-)
-
-# Private fields needed by the project's Siemens flow classifier.  The
-# template's other private blocks (especially 0019/0029 CSA) can contain
-# patient weight, protocol history, scanner IDs and large Phoenix blobs.
-ANON_KEEP_PRIVATE_TAGS = {
-    0x00510010, 0x00511008, 0x00511009, 0x0051100A, 0x0051100B,
-    0x0051100C, 0x0051100D, 0x0051100E, 0x00511013, 0x00511014,
-    0x00511016, 0x00511017, 0x00511018, 0x00511019,
-}
-ANON_CLEAR_KEYWORDS = {
-    "IssuerOfPatientID", "OtherPatientIDs", "OtherPatientNames",
-    "PatientBirthDate", "PatientBirthTime", "PatientSex", "PatientAge",
-    "PatientSize", "PatientWeight", "EthnicGroup", "Occupation",
-    "AdditionalPatientHistory", "PatientComments", "MedicalRecordLocator",
-    "AdmittingDiagnosesDescription", "ReferringPhysicianName",
-    "ReferringPhysicianIdentificationSequence", "PerformingPhysicianName",
-    "PerformingPhysicianIdentificationSequence", "NameOfPhysiciansReadingStudy",
-    "PhysiciansOfRecord", "PhysiciansOfRecordIdentificationSequence",
-    "OperatorsName", "OperatorIdentificationSequence", "InstitutionAddress",
-    "InstitutionName", "InstitutionalDepartmentName", "StationName",
-    "DeviceSerialNumber", "AccessionNumber", "StudyComments", "ImageComments",
-    "PerformedProcedureStepID", "StudyTime", "SeriesTime", "AcquisitionTime",
-    "ContentTime", "InstanceCreationTime",
-}
-ANON_DROP_SEQUENCE_KEYWORDS = {
-    "ReferencedImageSequence", "ReferencedInstanceSequence",
-    "ReferencedStudySequence", "ReferencedPatientSequence",
-}
-
-
-def _anonymize_template_dataset(dataset: pydicom.dataset.Dataset) -> None:
-    """Remove template-derived identifiers while retaining Siemens flow tags."""
-    clear_tags = {
-        int(pydicom.datadict.tag_for_keyword(keyword))
-        for keyword in ANON_CLEAR_KEYWORDS
-        if pydicom.datadict.tag_for_keyword(keyword) is not None
-    }
-
-    def scrub_nested(item: pydicom.dataset.Dataset) -> None:
-        for tag in list(item.keys()):
-            element = item[tag]
-            if element.VR == "SQ":
-                if element.keyword in ANON_DROP_SEQUENCE_KEYWORDS:
-                    del item[tag]
-                    continue
-                for child in element.value:
-                    scrub_nested(child)
-            if int(tag) in clear_tags:
-                del item[tag]
-
-    scrub_nested(dataset)
-    kept_private = {
-        int(tag): deepcopy(dataset[tag])
-        for tag in list(dataset.keys())
-        if tag.is_private and int(tag) in ANON_KEEP_PRIVATE_TAGS
-    }
-    dataset.remove_private_tags()
-    for tag in sorted(kept_private):
-        dataset.add(kept_private[tag])
-
-    # This is a file-meta workstation identifier, not a flow parameter.
-    if "SourceApplicationEntityTitle" in dataset.file_meta:
-        dataset.file_meta.SourceApplicationEntityTitle = "ANON"
-    dataset.file_meta.ImplementationClassUID = generate_uid()
-    dataset.file_meta.ImplementationVersionName = "H52DICOM_ANON_1"
-
+DEFAULT_TEMPLATE_ROOT = Path(__file__).resolve().parent / "templates" / "dicom_shells"
 
 def _current_date() -> str:
     return datetime.now().strftime("%Y%m%d")
@@ -142,13 +75,56 @@ def _decode_text_values(value: Any) -> list[str]:
     return [token.strip().upper() for token in output if token.strip()]
 
 
-def _load_array(file_path: str | Path | np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+def _parse_norm(value: float | str | None) -> float | None:
+    """Return the positive symmetric input normalization scale."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"pi", "π"}:
+            return float(np.pi)
+        value = float(normalized)
+    value = float(value)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"norm must be a positive finite number, got {value!r}")
+    return value
+
+
+def _load_array(
+    file_path: str | Path | np.ndarray,
+    source_group: str | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
     if not isinstance(file_path, (str, Path)):
         return np.asarray(file_path), {}
 
     with h5py.File(file_path, "r") as handle:
-        key = "img_complex" if "img_complex" in handle else "img" if "img" in handle else next(iter(handle.keys()))
-        array = np.asarray(handle[key][:])
+        if source_group:
+            group_name = str(source_group).strip("/")
+            if group_name not in handle or not isinstance(handle[group_name], h5py.Group):
+                raise ValueError(f"H5 group not found: {source_group}")
+            scope = handle[group_name]
+        else:
+            scope = handle
+        if (
+            "img_complex" not in scope
+            and "img" not in scope
+            and not ("mag" in scope and "flow" in scope)
+        ):
+            candidates = []
+            if not source_group:
+                handle.visititems(
+                    lambda name, obj: candidates.append(obj)
+                    if isinstance(obj, h5py.Group)
+                    and (
+                        "img_complex" in obj
+                        or "img" in obj
+                        or ("mag" in obj and "flow" in obj)
+                    )
+                    else None
+                )
+            if not candidates:
+                raise ValueError(f"no supported H5 image group found in {file_path}")
+            scope = candidates[0]
         metadata: dict[str, Any] = {}
         for source_key, target_key in (
             ("VENC", "venc_value"),
@@ -159,13 +135,57 @@ def _load_array(file_path: str | Path | np.ndarray) -> tuple[np.ndarray, dict[st
             ("VENCOrder", "venc_order"),
             ("VencOrder", "venc_order"),
         ):
-            if source_key in handle:
+            if source_key in scope:
+                metadata[target_key] = scope[source_key][()]
+            elif source_key in scope.attrs:
+                metadata[target_key] = scope.attrs[source_key]
+            elif source_key in handle:
                 metadata[target_key] = handle[source_key][()]
             elif source_key in handle.attrs:
                 metadata[target_key] = handle.attrs[source_key]
-        if "corr" in handle:
-            metadata["corr"] = np.asarray(handle["corr"][:], dtype=np.float32)
+        if "img_complex" in scope or "img" in scope:
+            key = "img_complex" if "img_complex" in scope else "img"
+            array = np.asarray(scope[key][:])
+        else:
+            magnitude = np.asarray(scope["mag"][:], dtype=np.float32)
+            velocity = np.asarray(scope["flow"][:], dtype=np.float32)
+            if velocity.ndim != 5 or velocity.shape[-1] != 3:
+                raise ValueError(f"native flow must be XYZT3, got {velocity.shape!r}")
+            if magnitude.shape != velocity.shape[:-1]:
+                raise ValueError(
+                    f"native mag/flow shape mismatch: mag={magnitude.shape}, flow={velocity.shape}"
+                )
+            # Keep the external writer's common channel-last representation;
+            # the native_contract marker below makes convert_array_to_dicom
+            # interpret channels 1:4 as velocity rather than phase.
+            array = np.concatenate([magnitude[..., None], velocity], axis=-1)
+        if "corr" in scope:
+            metadata["corr"] = np.asarray(scope["corr"][:], dtype=np.float32)
+        metadata["native_contract"] = all(
+            key in scope for key in ("mag", "flow", "RR", "Resolution", "VENC", "VENCOrder")
+        )
     return array, metadata
+
+
+def native_group_names(file_path: str | Path) -> list[str]:
+    """Return H5 groups containing either native ``mag``/``flow`` or image data."""
+    with h5py.File(file_path, "r") as handle:
+        if ("mag" in handle and "flow" in handle) or "img" in handle or "img_complex" in handle:
+            return [""]
+        names: list[str] = []
+
+        def visit(name: str, obj: h5py.Group) -> None:
+            if isinstance(obj, h5py.Group) and (
+                "img_complex" in obj or "img" in obj or ("mag" in obj and "flow" in obj)
+            ):
+                names.append(name)
+
+        handle.visititems(visit)
+    return names
+
+
+def _safe_group_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "__", name).strip("._") or "root"
 
 
 def _normalize_channel_last(img: np.ndarray) -> np.ndarray:
@@ -536,7 +556,7 @@ def _set_if_present(ds: pydicom.dataset.Dataset, tag: int, value) -> None:
 
 
 def _set_or_add(ds: pydicom.dataset.Dataset, tag: int, value) -> None:
-    """Set a standard element, adding it when anonymization removed it."""
+    """Set a standard element, adding it when a shell omits it."""
     if tag in ds:
         ds[tag].value = value
         return
@@ -585,12 +605,9 @@ def _write_series(
     para: dict,
     rr: float,
     phase: bool = True,
-    anonymize: bool = False,
 ) -> list[Path]:
     ori_dcm = pydicom.dcmread(str(template_file))
     tar_dcm = deepcopy(ori_dcm)
-    if anonymize:
-        _anonymize_template_dataset(tar_dcm)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # CVI compatibility mode: pixels have already been transposed/flipped into
@@ -705,9 +722,11 @@ def convert_array_to_dicom(
     rr: float | None = None,
     patient_name: str | None = None,
     date: str | None = None,
-    anonymize: bool = False,
+    source_group: str | None = None,
+    pcmra: bool = True,
+    norm: float | str | None = None,
 ) -> list[Path]:
-    img, metadata = _load_array(file_path)
+    img, metadata = _load_array(file_path, source_group=source_group)
     if venc_order is None:
         venc_order = _decode_text_values(metadata.get("venc_order")) or ["RL", "AP", "FH"]
     if spatial_order is None:
@@ -754,40 +773,64 @@ def convert_array_to_dicom(
     venc_value = venc_value[venc_indices]
     pixel_size = pixel_size[spatial_indices]
 
-    mag = img[..., 0]
-    max_mag = np.max(mag)
+    magnitude = np.asarray(img[..., 0], dtype=np.float32)
+    flow_input = np.asarray(img[..., 1:], dtype=np.float32)
+    max_mag = np.max(magnitude)
     if max_mag > 0:
-        mag = mag / max_mag
+        normalized_mag = magnitude / max_mag
     else:
-        mag = np.zeros_like(mag, dtype=np.float32)
+        normalized_mag = np.zeros_like(magnitude, dtype=np.float32)
+    normalized_mag = normalized_mag.transpose(
+        spatial_indices[0], spatial_indices[1], spatial_indices[2], 3
+    )
 
-    flow = img[..., 1:]
-    pcmra = np.sqrt(np.sum(flow**2, axis=-1)) * mag
-    img = np.asarray(img, dtype=np.float32)
-    img[..., 0] = pcmra
-    img[..., 1:] = flow
-
+    # Reorder velocity channels before converting native cm/s to Siemens phase.
+    # Keep a velocity copy for PCMRA generation.
     img = img[..., list(np.asarray(venc_indices) + 1) + [0]].transpose(
         spatial_indices[0], spatial_indices[1], spatial_indices[2], 4, 3
     )
-    img[..., :-1, :] *= venc_signs[None, None, None, :, None]
-    # H5 phase is encoded with the nominal/theoretical VENC.  Convert it to
-    # velocity and clip values outside the acquisition range instead of
-    # changing the VENC advertised by the DICOM tags.  CVI expects the pixel
-    # encoding and ``vXXX_*`` labels to use the same fixed VENC.
+    flow_velocity = flow_input[..., venc_indices].transpose(
+        spatial_indices[0], spatial_indices[1], spatial_indices[2], 4, 3
+    )
+    flow_velocity = np.asarray(flow_velocity, dtype=np.float32)
+    flow_velocity *= venc_signs[None, None, None, :, None]
+
+    # Native Dicom2H5 stores real-valued channels in velocity units.  Older
+    # H52Dicom callers supplied phase radians, so retain that compatibility
+    # path and convert both layouts to the phase representation expected by
+    # the DICOM pixel writer.
     nominal_venc = np.asarray(venc_value, dtype=np.float32).copy()
     nominal_venc_broadcast = nominal_venc[None, None, None, :, None]
-    velocity = img[..., :-1, :] / np.pi * nominal_venc_broadcast
-    velocity = np.clip(velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
-    img[..., :-1, :] = velocity / nominal_venc_broadcast * np.pi
+    norm_value = _parse_norm(norm)
+    if norm_value is not None:
+        flow_velocity = flow_velocity / norm_value * nominal_venc_broadcast
+        flow_velocity = np.clip(flow_velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
+    elif metadata.get("native_contract"):
+        flow_velocity = np.clip(flow_velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
+    else:
+        flow_velocity = np.clip(flow_velocity / np.pi * nominal_venc_broadcast,
+                                -nominal_venc_broadcast, nominal_venc_broadcast)
+
+    if pcmra:
+        magnitude = np.sqrt(np.sum(flow_velocity**2, axis=3)) * normalized_mag
+    else:
+        magnitude = magnitude.transpose(
+            spatial_indices[0], spatial_indices[1], spatial_indices[2], 3
+        )
+    img = np.asarray(img, dtype=np.float32)
+    img[..., -1, :] = magnitude
+    img[..., :-1, :] = flow_velocity / nominal_venc_broadcast * np.pi
 
     actual_venc_value = np.ceil(nominal_venc).astype("int16")
     if spatial_signs[0] == -1:
         img = img[::-1]
+        flow_velocity = flow_velocity[::-1]
     if spatial_signs[1] == -1:
         img = img[:, ::-1]
+        flow_velocity = flow_velocity[:, ::-1]
     if spatial_signs[2] == -1:
         img = img[:, :, ::-1]
+        flow_velocity = flow_velocity[:, :, ::-1]
 
     sequence_info, sequence_name = _build_labels(orientation, actual_venc_value)
     reference_paths = _resolve_reference_files()
@@ -850,13 +893,16 @@ def convert_array_to_dicom(
         # Indexing the channel already yields [slice, row, column, cardiac].
         # Do not squeeze: a single-slice or single-phase acquisition must retain
         # the four axes expected by _write_series.
-        imgv = img[..., dicom_index[target_index], :]
         if dicom_index[target_index] == 3:
+            imgv = img[..., dicom_index[target_index], :]
             imgv = _safe_minmax_unit(imgv)
+            imgv = (imgv * (para["target_max"] - para["target_min"])) + para["target_min"]
+            imgv = np.round(imgv).astype("uint16")
         else:
+            imgv = img[..., dicom_index[target_index], :]
             imgv = _safe_scale_unit(imgv)
-        imgv = (imgv * (para["target_max"] - para["target_min"])) + para["target_min"]
-        imgv = np.round(imgv).astype("uint16")
+            imgv = (imgv * (para["target_max"] - para["target_min"])) + para["target_min"]
+            imgv = np.round(imgv).astype("uint16")
 
         target_dir = target_root / DEFAULT_TARGET_FOLDERS[target_index]
         out_files.extend(
@@ -867,7 +913,6 @@ def convert_array_to_dicom(
                 para,
                 rr,
                 DEFAULT_PHASE_FLAGS[target_index],
-                anonymize=anonymize,
             )
         )
 
@@ -876,6 +921,59 @@ def convert_array_to_dicom(
 
 def array2dicom(*args, **kwargs):
     return convert_array_to_dicom(*args, **kwargs)
+
+
+def convert_h5_to_dicom(
+    file_path: str | Path,
+    out_path: str | Path,
+    *,
+    source_group: str | None = None,
+    orientation: str | None = DEFAULT_ORIENTATION,
+    patient_name: str | None = None,
+    date: str | None = None,
+    pcmra: bool = True,
+    norm: float | str | None = None,
+    venc_order: Sequence[str] | None = None,
+    venc_value: Sequence[float] | None = None,
+    spatial_order: Sequence[str] | None = None,
+    pixel_size: Sequence[float] | None = None,
+    rr: float | None = None,
+) -> dict[str, list[Path]]:
+    """Convert every supported image group in an H5 file.
+
+    A root-level ``mag``/``flow`` pair is exported once. Nested native groups
+    are exported into separate subdirectories under ``out_path``.
+    """
+    file_path = Path(file_path).expanduser().resolve()
+    out_path = Path(out_path).expanduser().resolve()
+    groups = native_group_names(file_path)
+    if source_group is not None:
+        requested = source_group.strip("/")
+        if requested not in groups:
+            raise ValueError(f"H5 group not found: {source_group}; choices={groups}")
+        groups = [requested]
+    if not groups:
+        raise ValueError(f"no supported image groups found in {file_path}")
+
+    results: dict[str, list[Path]] = {}
+    for group in groups:
+        target = out_path if group == "" else out_path / _safe_group_name(group)
+        results[group or "root"] = convert_array_to_dicom(
+            file_path=file_path,
+            out_path=target,
+            orientation=orientation,
+            patient_name=patient_name,
+            date=date,
+            source_group=group or None,
+            pcmra=pcmra,
+            norm=norm,
+            venc_order=venc_order,
+            venc_value=venc_value,
+            spatial_order=spatial_order,
+            pixel_size=pixel_size,
+            rr=rr,
+        )
+    return results
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -896,10 +994,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rr", type=float, default=None, help="RR interval.")
     parser.add_argument("--patient-name", type=str, default=None, help="Patient name.")
     parser.add_argument("--date", type=str, default=None, help="Study date (YYYYMMDD).")
+    parser.add_argument("--source-group", type=str, default=None, help="H5 group containing the native mag/flow datasets.")
     parser.add_argument(
-        "--anonymize",
+        "--norm",
+        type=str,
+        default=None,
+        help="Symmetric input flow range. Use 'pi' for [-pi, pi]; output velocity is flow / norm * VENC.",
+    )
+    parser.add_argument(
+        "--no-pcmra",
         action="store_true",
-        help="Remove template-derived patient/scanner/CSA metadata while preserving generated name, ID, dates and CVI flow tags.",
+        help="Keep the native magnitude instead of generating a PCMRA magnitude series.",
     )
     return parser
 
@@ -907,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    convert_array_to_dicom(
+    convert_h5_to_dicom(
         file_path=args.file_path,
         out_path=args.out_path,
         orientation=args.orientation,
@@ -918,6 +1023,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rr=args.rr,
         patient_name=args.patient_name,
         date=args.date,
-        anonymize=args.anonymize,
+        source_group=args.source_group,
+        pcmra=not args.no_pcmra,
+        norm=args.norm,
     )
     return 0
