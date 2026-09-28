@@ -43,7 +43,8 @@ DEFAULT_ORIENTATION = "auto"
 ORIENTATION_SPATIAL_ORDERS = {
     "Tra": ("FH", "AP", "RL"),
     "Cor": ("AP", "HF", "RL"),
-    "Sag": ("RL", "HF", "PA"),
+    # Match the CVI Siemens writer: Sagittal data is reordered as RL/HF/AP.
+    "Sag": ("RL", "HF", "AP"),
 }
 
 # DICOM patient coordinates are LPS: +X=left, +Y=posterior, +Z=head.
@@ -507,17 +508,15 @@ def _build_labels(orientation: str, venc_value: Sequence[int]) -> tuple[list[str
             f"WIP_f_v{v2}rl",
         ]
     elif orientation == "Sag":
-        # Vendor Sag convention: RL is through-plane; the HF/AP encodings are
-        # emitted in the FH/RL-labelled in-plane series slots.
         sequence_info = [
             "",
-            f"v{v0}_inplane_fh",
+            f"v{v0}_inplane_ap",
             f"v{v1}_inplane_rl",
             f"v{v2}_through",
         ]
         sequence_name = [
             "WIP_fl3d1r2",
-            f"WIP_f_v{v0}fh",
+            f"WIP_f_v{v0}ap",
             f"WIP_f_v{v1}rl",
             f"WIP_f_v{v2}in",
         ]
