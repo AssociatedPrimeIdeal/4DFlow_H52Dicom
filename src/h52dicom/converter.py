@@ -93,6 +93,7 @@ def _parse_norm(value: float | str | None) -> float | None:
 def _load_array(
     file_path: str | Path | np.ndarray,
     source_group: str | None = None,
+    use_corr: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     if not isinstance(file_path, (str, Path)):
         return np.asarray(file_path), {}
@@ -159,8 +160,9 @@ def _load_array(
             # the native_contract marker below makes convert_array_to_dicom
             # interpret channels 1:4 as velocity rather than phase.
             array = np.concatenate([magnitude[..., None], velocity], axis=-1)
-        if "corr" in scope:
+        if use_corr and "corr" in scope:
             metadata["corr"] = np.asarray(scope["corr"][:], dtype=np.float32)
+        metadata["corr_enabled"] = bool(use_corr)
         metadata["native_contract"] = all(
             key in scope for key in ("mag", "flow", "RR", "Resolution", "VENC", "VENCOrder")
         )
@@ -211,8 +213,12 @@ def _normalize_corr_channel_last(corr: np.ndarray, img_shape: tuple[int, int, in
     source_shapes = {
         (channels - 1, 1, slices, rows, columns),
         (channels - 1, time_count, slices, rows, columns),
+        (slices, rows, columns, 1, channels - 1),
+        (slices, rows, columns, time_count, channels - 1),
     }
     if corr.shape in source_shapes:
+        if corr.shape[:3] == (slices, rows, columns):
+            return corr.transpose(2, 1, 0, 3, 4)
         return corr.transpose(4, 3, 2, 1, 0)
 
     raise ValueError(
@@ -221,11 +227,38 @@ def _normalize_corr_channel_last(corr: np.ndarray, img_shape: tuple[int, int, in
     )
 
 
-def _apply_phase_correction(img: np.ndarray, corr: np.ndarray | None) -> np.ndarray:
+def _validate_phase_range(flow: np.ndarray) -> None:
+    finite = np.asarray(flow, dtype=np.float32)
+    if not np.isfinite(finite).all():
+        raise ValueError("corr requires finite flow phase values in [-pi, pi]")
+    tolerance = 1e-5
+    low = float(np.min(finite))
+    high = float(np.max(finite))
+    if low < -np.pi - tolerance or high > np.pi + tolerance:
+        raise ValueError(
+            "corr requires real-valued flow phases in [-pi, pi]; "
+            f"received range [{low:.6g}, {high:.6g}]"
+        )
+
+
+def _apply_phase_correction(
+    img: np.ndarray,
+    corr: np.ndarray | None,
+    *,
+    flow_is_phase: bool = False,
+) -> np.ndarray:
     if corr is None:
         return img
     if not np.iscomplexobj(img):
-        raise ValueError("corr can only be applied to complex-valued phase encodings")
+        if not flow_is_phase:
+            raise ValueError("corr requires flow input encoded as phase in [-pi, pi]")
+        _validate_phase_range(img[..., 1:])
+        corr = _normalize_corr_channel_last(corr, tuple(int(value) for value in img.shape))
+        corrected = np.array(img, copy=True)
+        corrected[..., 1:] = np.angle(
+            np.exp(1j * (corrected[..., 1:] - corr))
+        ).astype(np.float32)
+        return corrected
     corr = _normalize_corr_channel_last(corr, tuple(int(value) for value in img.shape))
     corrected = np.array(img, copy=True)
     corrected[..., 1:] *= np.exp(-1j * corr)
@@ -725,8 +758,9 @@ def convert_array_to_dicom(
     source_group: str | None = None,
     pcmra: bool = True,
     norm: float | str | None = None,
+    corr: bool = False,
 ) -> list[Path]:
-    img, metadata = _load_array(file_path, source_group=source_group)
+    img, metadata = _load_array(file_path, source_group=source_group, use_corr=corr)
     if venc_order is None:
         venc_order = _decode_text_values(metadata.get("venc_order")) or ["RL", "AP", "FH"]
     if spatial_order is None:
@@ -763,7 +797,13 @@ def convert_array_to_dicom(
     venc_indices, venc_signs = _order_to_target(venc_order, venc_order_target)
     spatial_indices, spatial_signs = _order_to_target(spatial_order, spatial_order_target)
 
-    img = _apply_phase_correction(img, metadata.get("corr"))
+    if corr and metadata.get("corr") is None:
+        raise ValueError("corr was enabled, but the selected H5 group has no corr dataset")
+    img = _apply_phase_correction(
+        img,
+        metadata.get("corr") if corr else None,
+        flow_is_phase=bool(corr and not np.iscomplexobj(img)),
+    )
     if np.iscomplexobj(img):
         img, venc_value = _complex_to_phase_layout(img, venc_value)
     elif img.shape[-1] != 4:
@@ -805,7 +845,7 @@ def convert_array_to_dicom(
     if norm_value is not None:
         flow_velocity = flow_velocity / norm_value * nominal_venc_broadcast
         flow_velocity = np.clip(flow_velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
-    elif metadata.get("native_contract"):
+    elif metadata.get("native_contract") and not (corr and metadata.get("corr_enabled")):
         flow_velocity = np.clip(flow_velocity, -nominal_venc_broadcast, nominal_venc_broadcast)
     else:
         flow_velocity = np.clip(flow_velocity / np.pi * nominal_venc_broadcast,
@@ -933,6 +973,7 @@ def convert_h5_to_dicom(
     date: str | None = None,
     pcmra: bool = True,
     norm: float | str | None = None,
+    corr: bool = False,
     venc_order: Sequence[str] | None = None,
     venc_value: Sequence[float] | None = None,
     spatial_order: Sequence[str] | None = None,
@@ -967,6 +1008,7 @@ def convert_h5_to_dicom(
             source_group=group or None,
             pcmra=pcmra,
             norm=norm,
+            corr=corr,
             venc_order=venc_order,
             venc_value=venc_value,
             spatial_order=spatial_order,
@@ -1006,6 +1048,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep the native magnitude instead of generating a PCMRA magnitude series.",
     )
+    parser.add_argument(
+        "--corr",
+        action="store_true",
+        help="Apply the H5 corr phase cache; requires real flow input in [-pi, pi].",
+    )
     return parser
 
 
@@ -1026,5 +1073,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_group=args.source_group,
         pcmra=not args.no_pcmra,
         norm=args.norm,
+        corr=args.corr,
     )
     return 0

@@ -27,6 +27,11 @@ Siemens shell DICOMs are bundled inside this library under
 shells without runtime anonymization. To anonymize output, replace the bundled
 shells with audited anonymized shells before running the converter.
 
+The H5 `corr` phase cache is ignored by default. Enable it explicitly with
+`--corr`; this mode requires real-valued input flow phases in `[-pi, pi]` and
+subtracts the cached correction with phase wrapping. Native velocity H5 data
+in cm/s should therefore use the default (`corr` disabled).
+
 Legacy entry point:
 
 ```bash
