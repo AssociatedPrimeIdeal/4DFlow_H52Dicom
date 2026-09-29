@@ -43,8 +43,7 @@ DEFAULT_ORIENTATION = "auto"
 ORIENTATION_SPATIAL_ORDERS = {
     "Tra": ("FH", "AP", "RL"),
     "Cor": ("AP", "HF", "RL"),
-    # Match the CVI Siemens writer: Sagittal data is reordered as RL/HF/AP.
-    "Sag": ("RL", "HF", "AP"),
+    "Sag": ("RL", "HF", "PA"),
 }
 
 # DICOM patient coordinates are LPS: +X=left, +Y=posterior, +Z=head.
@@ -833,6 +832,14 @@ def convert_array_to_dicom(
     )
     flow_velocity = np.asarray(flow_velocity, dtype=np.float32)
     flow_velocity *= venc_signs[None, None, None, :, None]
+
+    # CVI's Siemens sagittal convention stores the through-plane (third
+    # velocity) direction with the opposite polarity to the native H5
+    # direction label.  This is a velocity sign change, independent of the
+    # spatial-axis reversal below; keep it in the velocity array so PCMRA and
+    # the encoded phase pixels use the same convention.
+    if orientation == "Sag":
+        flow_velocity[..., 2, :] *= -1.0
 
     # Native Dicom2H5 stores real-valued channels in velocity units.  Older
     # H52Dicom callers supplied phase radians, so retain that compatibility
