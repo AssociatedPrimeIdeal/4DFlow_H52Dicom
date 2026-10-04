@@ -23,9 +23,8 @@ multiple sequence groups, the command exports all groups by default; select
 one explicitly with `--source-group <group>`. PCMRA magnitude generation is
 enabled by default; use `--no-pcmra` to keep the native magnitude. The four
 Siemens shell DICOMs are bundled inside this library under
-`src/h52dicom/templates/dicom_shells`. Output metadata is copied from those
-shells without runtime anonymization. To anonymize output, replace the bundled
-shells with audited anonymized shells before running the converter.
+`src/h52dicom/templates/dicom_shells`. They are audited anonymized shells;
+output metadata is copied from them without runtime anonymization.
 
 The H5 `corr` phase cache is ignored by default. Enable it explicitly with
 `--corr`; this mode requires real-valued input flow phases in `[-pi, pi]` and

@@ -33,7 +33,7 @@ DEFAULT_DICOM_INDEX = (3, 0, 1, 2)
 DEFAULT_TARGET_MAX = (540, 4095, 4095, 4095)
 DEFAULT_TARGET_MIN = (0, 0, 0, 0)
 DEFAULT_PROTOCOL_NAME = "785B_4Dflow_ePAT3_retro_native"
-DEFAULT_ORIENTATION = "auto"
+DEFAULT_ORIENTATION = "Tra"
 
 # Each value is (slice, image-row, image-column).  The image directions are
 # intentionally right-handed: ``column_direction x row_direction`` equals the
@@ -43,7 +43,7 @@ DEFAULT_ORIENTATION = "auto"
 ORIENTATION_SPATIAL_ORDERS = {
     "Tra": ("FH", "AP", "RL"),
     "Cor": ("AP", "HF", "RL"),
-    "Sag": ("RL", "HF", "PA"),
+    "Sag": ("RL", "HF", "AP"),
 }
 
 # DICOM patient coordinates are LPS: +X=left, +Y=posterior, +Z=head.
@@ -654,13 +654,13 @@ def _write_series(
     _set_if_present(tar_dcm, 0x00080021, para["date"])
     _set_if_present(tar_dcm, 0x00080022, para["date"])
     _set_if_present(tar_dcm, 0x00080023, para["date"])
-    # InstitutionName is cleared from the template first; this is the
-    # generator-owned label explicitly allowed by the caller.
-    _set_or_add(tar_dcm, 0x00080080, para["institution_name"])
-    _set_if_present(tar_dcm, 0x00081030, para["study_description"])
+    if not para["preserve_template_metadata"]:
+        _set_or_add(tar_dcm, 0x00080080, para["institution_name"])
+        _set_if_present(tar_dcm, 0x00081030, para["study_description"])
     _set_if_present(tar_dcm, 0x0008103E, para["series_description"])
-    _set_if_present(tar_dcm, 0x00100010, para["patient_name"])
-    _set_if_present(tar_dcm, 0x00100020, f"{para['patient_name']}_ID")
+    if para["patient_name"] is not None:
+        _set_if_present(tar_dcm, 0x00100010, para["patient_name"])
+        _set_if_present(tar_dcm, 0x00100020, f"{para['patient_name']}_ID")
     _set_if_present(tar_dcm, 0x00180024, para["sequence_name"])
     _set_if_present(tar_dcm, 0x00180050, para["slice_thickness"])
     _set_if_present(tar_dcm, 0x00180080, para["repetition_time"])
@@ -679,7 +679,8 @@ def _write_series(
     _set_if_present(tar_dcm, 0x00291009, para["date"])
     _set_if_present(tar_dcm, 0x00291019, para["date"])
     _set_if_present(tar_dcm, 0x00400244, para["date"])
-    _set_if_present(tar_dcm, 0x00400254, para["study_description"])
+    if not para["preserve_template_metadata"]:
+        _set_if_present(tar_dcm, 0x00400254, para["study_description"])
     _set_if_present(tar_dcm, 0x0051100B, para["acq_matrix_text"])
     _set_if_present(tar_dcm, 0x0051100C, para["fov_text"])
     _set_if_present(tar_dcm, 0x00511017, para["slice_text"])
@@ -719,9 +720,12 @@ def _write_series(
                 tar_dcm.file_meta.MediaStorageSOPClassUID = tar_dcm.SOPClassUID
                 _set_if_present(tar_dcm, 0x00191015, deepcopy(slice_position))
                 _set_if_present(tar_dcm, 0x00200013, str(index))
-                _set_if_present(tar_dcm, 0x00200032, deepcopy(image_position))
+                formatted_image_position = [
+                    _format_dicom_decimal(value) for value in image_position
+                ]
+                _set_if_present(tar_dcm, 0x00200032, formatted_image_position)
                 slice_location = float(image_position[-1])
-                _set_if_present(tar_dcm, 0x00201041, str(slice_location))
+                _set_if_present(tar_dcm, 0x00201041, _format_dicom_decimal(slice_location))
 
                 slice_data = np.asarray(np.squeeze(data[j, :, :, i]))
                 _set_if_present(tar_dcm, 0x00280106, int(np.min(slice_data)))
@@ -757,6 +761,7 @@ def convert_array_to_dicom(
     pcmra: bool = True,
     norm: float | str | None = None,
     corr: bool = False,
+    preserve_template_metadata: bool = False,
 ) -> list[Path]:
     img, metadata = _load_array(file_path, source_group=source_group, use_corr=corr)
     if venc_order is None:
@@ -769,7 +774,7 @@ def convert_array_to_dicom(
         pixel_size = metadata.get("pixel_size", (1.8, 1.9, 2.4))
     if rr is None:
         rr = float(np.asarray(metadata.get("rr", 1000.0), dtype=float).reshape(-1)[0])
-    if patient_name is None:
+    if patient_name is None and not preserve_template_metadata:
         patient_name = Path(file_path).stem if isinstance(file_path, (str, Path)) else "patient"
 
     venc_order = np.asarray([str(value).upper() for value in venc_order])
@@ -893,13 +898,14 @@ def convert_array_to_dicom(
     for target_index in range(nv):
         para = {
             "date": date,
-            "institution_name": "ShanghaiTech",
-            "study_description": "ShanghaiTech",
+            "institution_name": "ANONYMIZED",
+            "study_description": "ANONYMIZED",
             "series_description": DEFAULT_SERIES_DESCRIPTIONS[target_index],
             "SeriesNumber": series_number_base + dicom_index[target_index],
             "study_uid": study_uid,
             "series_uid": generate_uid(),
             "patient_name": patient_name,
+            "preserve_template_metadata": bool(preserve_template_metadata),
             "sequence_name": sequence_name[target_index],
             "slice_thickness": _format_dicom_decimal(fov[0] / matrix_size[0]),
             "repetition_time": "6",
@@ -972,6 +978,7 @@ def convert_h5_to_dicom(
     pcmra: bool = True,
     norm: float | str | None = None,
     corr: bool = False,
+    preserve_template_metadata: bool = False,
     venc_order: Sequence[str] | None = None,
     venc_value: Sequence[float] | None = None,
     spatial_order: Sequence[str] | None = None,
@@ -1007,6 +1014,7 @@ def convert_h5_to_dicom(
             pcmra=pcmra,
             norm=norm,
             corr=corr,
+            preserve_template_metadata=preserve_template_metadata,
             venc_order=venc_order,
             venc_value=venc_value,
             spatial_order=spatial_order,
@@ -1051,6 +1059,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply the H5 corr phase cache; requires real flow input in [-pi, pi].",
     )
+    parser.add_argument(
+        "--preserve-template-metadata",
+        action="store_true",
+        help="Keep patient and scanner metadata from the DICOM shell.",
+    )
     return parser
 
 
@@ -1072,5 +1085,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         pcmra=not args.no_pcmra,
         norm=args.norm,
         corr=args.corr,
+        preserve_template_metadata=args.preserve_template_metadata,
     )
     return 0
